@@ -102,6 +102,7 @@ export interface ContractSummary {
   status: string;
   wasm_hash: string | null;
   added_at: string;
+  expiring_keys_count?: number;
 }
 
 export interface ContractsListResponse {

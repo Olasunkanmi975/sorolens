@@ -13,6 +13,7 @@ import type {
   MonitoredContractsResponse,
   StatsResponse,
   StorageResponse,
+  StorageEntry,
   TimeWindow,
   TrackContractRequest,
   WatchdogStats,
@@ -167,6 +168,22 @@ export function getContractStorage(
   const qs = search.toString();
   return fetchJson<StorageResponse>(
     `${API_URL}/api/v1/contracts/${id}/storage${qs ? "?" + qs : ""}`,
+  );
+}
+
+export function getExpiringStorage(
+  id: string,
+  within: number = 86400,
+): Promise<{
+  contract_id: string;
+  current_ledger: number;
+  within_seconds: number;
+  entries: StorageEntry[];
+  storage: StorageEntry[];
+  count: number;
+}> {
+  return fetchJson(
+    `${API_URL}/api/v1/contracts/${id}/storage/expiring?within=${within}`,
   );
 }
 

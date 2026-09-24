@@ -26,6 +26,7 @@ import { EventVolumeChart } from "@/components/EventVolumeChart";
 import { InvocationChart } from "@/components/InvocationChart";
 import { EventsTable } from "@/components/EventsTable";
 import { StoragePanel } from "@/components/StoragePanel";
+import { StorageHealthPanel } from "@/components/StorageHealthPanel";
 import { SnapshotPanel } from "@/components/SnapshotPanel";
 import { HealthScoreCard } from "@/components/HealthScoreCard";
 
@@ -342,17 +343,29 @@ function ContractDetailContent({ id }: { id: string }) {
       </section>
 
       <section className="mb-8">
-        <h2 className="mb-4 text-xl font-semibold">Storage TTL</h2>
-        {storageLoading ? (
-          <TableSkeleton />
-        ) : (
-          <StoragePanel
-            entries={storage}
+        <h2 className="mb-4 text-xl font-semibold">Storage TTL Health</h2>
+        <div className="space-y-6">
+          <StorageHealthPanel
+            contractId={id}
             currentLedger={currentLedger}
-            onLoadMore={handleLoadMoreStorage}
-            hasMore={storageHasMore}
+            initialEntries={storage}
           />
-        )}
+          <div>
+            <h3 className="mb-3 text-sm font-medium text-[var(--color-text-secondary)]">
+              All Tracked Storage Entries
+            </h3>
+            {storageLoading ? (
+              <TableSkeleton />
+            ) : (
+              <StoragePanel
+                entries={storage}
+                currentLedger={currentLedger}
+                onLoadMore={handleLoadMoreStorage}
+                hasMore={storageHasMore}
+              />
+            )}
+          </div>
+        </div>
       </section>
 
       <section className="mb-8">

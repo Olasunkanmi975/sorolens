@@ -58,6 +58,7 @@ func New(h *handler.Handler) http.Handler {
 		get("/contracts/{id}/events", h.ListEvents)
 		get("/contracts/{id}/invocations", h.ListInvocations)
 		get("/contracts/{id}/storage", h.ListStorageEntries)
+		get("/contracts/{id}/storage/expiring", h.GetExpiringStorage)
 		get("/contracts/{id}/stats", h.ContractStats)
 		get("/contracts/{id}/forecast", h.ContractForecast)
 		get("/contracts/{id}/snapshot", h.ContractSnapshot)
