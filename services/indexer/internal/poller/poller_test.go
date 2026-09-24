@@ -103,17 +103,19 @@ type fakeStore struct {
 	hourly       map[string][]HourlyActivity // contractID -> buckets
 	alerts       []Alert
 	insertErr    error
-	healthInputs map[string]HealthInputs // contractID -> inputs
-	healthScores []ContractHealthScore
+	healthInputs   map[string]HealthInputs // contractID -> inputs
+	healthScores   []ContractHealthScore
+	indexerCursors map[string]uint32
 }
 
 func newFakeStore(contracts []Contract) *fakeStore {
 	return &fakeStore{
-		contracts:    contracts,
-		syncStates:   make(map[string]SyncState),
-		hourly:       make(map[string][]HourlyActivity),
-		wasmHashes:   make(map[string]string),
-		healthInputs: make(map[string]HealthInputs),
+		contracts:      contracts,
+		syncStates:     make(map[string]SyncState),
+		hourly:         make(map[string][]HourlyActivity),
+		wasmHashes:     make(map[string]string),
+		healthInputs:   make(map[string]HealthInputs),
+		indexerCursors: make(map[string]uint32),
 	}
 }
 
@@ -161,6 +163,34 @@ func (f *fakeStore) UpsertSyncState(_ context.Context, s SyncState) error {
 
 func (f *fakeStore) CreateNextMonthPartition(_ context.Context) error { return nil }
 func (f *fakeStore) CreateMonthlyPartitionIfNotExists(_ context.Context, _ int, _ int) error {
+	return nil
+}
+
+func (f *fakeStore) GetIndexerCursor(_ context.Context, network string) (uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.indexerCursors[network], nil
+}
+
+func (f *fakeStore) SetIndexerCursor(_ context.Context, network string, ledger uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.indexerCursors[network] = ledger
+	return nil
+}
+
+func (f *fakeStore) BatchInsertWithCursor(ctx context.Context, network string, ledger uint32, events []Event, invocations []Invocation, syncState SyncState) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.insertErr != nil {
+		return f.insertErr
+	}
+	f.events = append(f.events, events...)
+	f.invocations = append(f.invocations, invocations...)
+	if syncState.ContractID != "" {
+		f.syncStates[syncState.ContractID] = syncState
+	}
+	f.indexerCursors[network] = ledger
 	return nil
 }
 
@@ -746,5 +776,124 @@ func TestPoller_noUpgradeWhenWasmHashUnchanged(t *testing.T) {
 	}
 	if len(store.upgrades) != 0 {
 		t.Errorf("expected no upgrade row when hash unchanged, got %d", len(store.upgrades))
+	}
+}
+
+func TestPollerCrashRecovery_ResumeFromLastBatch(t *testing.T) {
+	t.Parallel()
+
+	contractID := "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+	network := "testnet"
+
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active", Network: network}})
+	store.syncStates[contractID] = SyncState{ContractID: contractID, LastLedger: 500}
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 600},
+		events: map[string]*GetEventsResult{
+			contractID: {
+				LatestLedger: 600,
+				Events: []RPCEvent{
+					{ID: "evt-550", ContractID: contractID, Ledger: 550, TxHash: "tx-550"},
+				},
+			},
+		},
+	}
+
+	cfg := Config{LedgerWindow: 50}
+
+	// First pass: poller runs for batch [501, 550] and commits successfully.
+	p1 := NewWithRPCClients(map[string]RPCClient{network: rpc}, store, newFakeRedis(), cfg, testLogger())
+	if err := p1.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("first pass error: %v", err)
+	}
+
+	cursor, err := store.GetIndexerCursor(context.Background(), network)
+	if err != nil {
+		t.Fatalf("failed to get cursor: %v", err)
+	}
+	if cursor != 550 {
+		t.Fatalf("expected cursor 550, got %d", cursor)
+	}
+	if len(store.events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(store.events))
+	}
+
+	// Second pass: simulate crash mid-poll while processing [551, 600].
+	// In a real crash, uncommitted writes are aborted/rolled back.
+	store.insertErr = errors.New("simulated crash: database connection lost mid-batch")
+	p2 := NewWithRPCClients(map[string]RPCClient{network: rpc}, store, newFakeRedis(), cfg, testLogger())
+	_ = p2.Run(context.Background(), "once")
+
+	// Verify that cursor and sync state were NOT advanced to 600
+	cursorAfterCrash, _ := store.GetIndexerCursor(context.Background(), network)
+	if cursorAfterCrash != 550 {
+		t.Fatalf("cursor should still be 550 after crash, got %d", cursorAfterCrash)
+	}
+
+	// Third pass (restart after crash): clear error and run again.
+	store.insertErr = nil
+	rpc.events[contractID] = &GetEventsResult{
+		LatestLedger: 600,
+		Events: []RPCEvent{
+			{ID: "evt-600", ContractID: contractID, Ledger: 600, TxHash: "tx-600"},
+		},
+	}
+	p3 := NewWithRPCClients(map[string]RPCClient{network: rpc}, store, newFakeRedis(), cfg, testLogger())
+	if err := p3.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("restart pass error: %v", err)
+	}
+
+	// Verify it successfully continued from ledger 550 and committed up to 600!
+	finalCursor, _ := store.GetIndexerCursor(context.Background(), network)
+	if finalCursor != 600 {
+		t.Fatalf("expected cursor 600 after restart, got %d", finalCursor)
+	}
+	finalSync, _ := store.GetSyncState(context.Background(), contractID)
+	if finalSync.LastLedger != 600 {
+		t.Fatalf("expected sync state 600 after restart, got %d", finalSync.LastLedger)
+	}
+	if len(store.events) != 2 {
+		t.Fatalf("expected 2 events in store after recovery, got %d", len(store.events))
+	}
+}
+
+func TestPollerCrashRecovery_ResumeFromNetworkCursor(t *testing.T) {
+	t.Parallel()
+
+	contractID := "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+	network := "mainnet"
+
+	store := newFakeStore([]Contract{{ID: contractID, Status: "active", Network: network}})
+	// Contract has no sync state recorded yet, but the network cursor was committed at 1000
+	_ = store.SetIndexerCursor(context.Background(), network, 1000)
+
+	rpc := &fakeRPC{
+		latestLedger: &LatestLedger{Sequence: 1050},
+		events: map[string]*GetEventsResult{
+			contractID: {
+				LatestLedger: 1050,
+				Events: []RPCEvent{
+					{ID: "evt-1050", ContractID: contractID, Ledger: 1050, TxHash: "tx-1050"},
+				},
+			},
+		},
+	}
+
+	p := NewWithRPCClients(map[string]RPCClient{network: rpc}, store, newFakeRedis(), Config{LedgerWindow: 100}, testLogger())
+	if err := p.Run(context.Background(), "once"); err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+
+	// It should resume from 1001 rather than backfilling 100,000 ledgers
+	if len(rpc.eventsCalls) == 0 {
+		t.Fatal("expected GetEvents to be called")
+	}
+	if rpc.eventsCalls[0].StartLedger != 1001 {
+		t.Fatalf("expected start ledger 1001 (resumed from network cursor 1000), got %d", rpc.eventsCalls[0].StartLedger)
+	}
+	cursor, _ := store.GetIndexerCursor(context.Background(), network)
+	if cursor != 1050 {
+		t.Fatalf("expected network cursor 1050, got %d", cursor)
 	}
 }

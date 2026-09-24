@@ -435,18 +435,29 @@ func (p *Poller) processContract(ctx context.Context, contract Contract) error {
 		return fmt.Errorf("get sync state: %w", err)
 	}
 
+	networkCursor, err := p.store.GetIndexerCursor(ctx, network)
+	if err != nil {
+		p.log.Warn("failed to fetch indexer cursor for network (continuing)",
+			"network", network,
+			"err", err,
+		)
+	}
+
 	var startLedger uint32
 	if syncState.LastLedger == 0 {
-		// New contract: best-effort backfill from within the retention window.
-		if latest.Sequence > newContractBackfillWindow {
+		if networkCursor > 0 {
+			// Resume after the last successfully committed network batch
+			startLedger = networkCursor + 1
+		} else if latest.Sequence > newContractBackfillWindow {
+			// New contract: best-effort backfill from within the retention window.
 			startLedger = latest.Sequence - newContractBackfillWindow
 		} else {
 			startLedger = 1
 		}
-		p.log.Warn("new contract, starting partial backfill; events before this ledger are unavailable",
+		p.log.Warn("starting sync for contract",
 			"contract_id", contractID,
 			"start_ledger", startLedger,
-			"retention_window_ledgers", newContractBackfillWindow,
+			"network_cursor", networkCursor,
 		)
 	} else {
 		startLedger = syncState.LastLedger + 1
@@ -476,20 +487,9 @@ func (p *Poller) processContract(ctx context.Context, contract Contract) error {
 		return err
 	}
 
-	if len(events) > 0 {
-		if err := p.store.BatchInsertEvents(ctx, events); err != nil {
-			return fmt.Errorf("batch insert events: %w", err)
-		}
-	}
-	if len(invocations) > 0 {
-		if err := p.store.BatchInsertInvocations(ctx, invocations); err != nil {
-			return fmt.Errorf("batch insert invocations: %w", err)
-		}
-	}
-
 	newState := SyncState{ContractID: contractID, LastLedger: endLedger}
-	if err := p.store.UpsertSyncState(ctx, newState); err != nil {
-		return fmt.Errorf("upsert sync state: %w", err)
+	if err := p.store.BatchInsertWithCursor(ctx, network, endLedger, events, invocations, newState); err != nil {
+		return fmt.Errorf("batch insert with cursor: %w", err)
 	}
 
 	log.Info("contract indexed",
